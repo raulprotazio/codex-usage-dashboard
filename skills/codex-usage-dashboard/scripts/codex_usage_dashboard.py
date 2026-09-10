@@ -1518,7 +1518,7 @@ class RolloutReadStats:
 
 
 def fast_ignored_rollout_projection(raw_line: bytes) -> dict[str, Any] | None:
-    if len(raw_line) < FAST_ROLLOUT_MIN_BYTES or not raw_line.endswith(b"}}\n"):
+    if len(raw_line) < FAST_ROLLOUT_MIN_BYTES or not raw_line.endswith((b"}}\n", b"}}\r\n")):
         return None
     match = FAST_ROLLOUT_HEADER.match(raw_line)
     if match is None:
@@ -2383,8 +2383,8 @@ class PersistentParseCache:
                     PARSE_CACHE_VERSION,
                     entry.mtime_ns,
                     entry.size,
-                    entry.device,
-                    entry.inode,
+                    str(entry.device).encode("ascii"),
+                    str(entry.inode).encode("ascii"),  # Windows file IDs can exceed SQLite signed int64.
                     int(entry.append_safe),
                     entry.prefix_digest,
                     entry.tail_digest,
@@ -2776,7 +2776,8 @@ class CodexUsageAnalyzer:
                         directories.append(path)
                     elif path.match("*.jsonl"):
                         try:
-                            file_stat = entry.stat()
+                            # Windows DirEntry.stat() omits the file ID used by our cache.
+                            file_stat = path.stat() if os.name == "nt" else entry.stat()
                         except OSError:
                             continue
                         files.append(path)
@@ -8573,6 +8574,7 @@ HTML = r"""<!doctype html>
 
 
 def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
+    source_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     class Handler(BaseHTTPRequestHandler):
         server_version = "CodexUsageDashboard/1.0"
 
@@ -8584,6 +8586,8 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
                 pass
 
         def do_GET(self) -> None:
+            if not self.allow_local_request():
+                return
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
@@ -8596,6 +8600,8 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
                     {
                         "ok": True,
                         "app": "codex-usage-dashboard",
+                        "local_hardening": "v1",
+                        "source_sha256": source_digest,
                         "features": DASHBOARD_FEATURES,
                         "device_short_code": analyzer.remote_store.current_device_code if analyzer.remote_store else current_device_short_code(),
                     }
@@ -8691,6 +8697,8 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
             self.send_json({"error": "not found"}, status=404)
 
         def do_POST(self) -> None:
+            if not self.allow_local_request(mutation=True):
+                return
             parsed = urlparse(self.path)
             path = parsed.path
             try:
@@ -8736,6 +8744,22 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
 
             self.send_json({"ok": False, "error": "not found"}, status=404)
 
+        def allow_local_request(self, mutation: bool = False) -> bool:
+            port = self.server.server_port
+            allowed = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+            host = self.headers.get("Host", "")
+            origin = self.headers.get("Origin")
+            if host not in allowed or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                self.send_json({"error": "Local requests only"}, status=403)
+                return False
+            if origin is not None and origin != f"http://{host}":
+                self.send_json({"error": "Invalid origin"}, status=403)
+                return False
+            if mutation and self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                self.send_json({"error": "Expected application/json"}, status=415)
+                return False
+            return True
+
         def read_json_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or "0")
             if length <= 0:
@@ -8767,6 +8791,9 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'")
             if extra_headers:
                 for key, value in extra_headers.items():
                     self.send_header(key, value)
@@ -8924,6 +8951,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.host not in ("127.0.0.1", "localhost"):
+        raise ValueError("This local fork only listens on loopback.")
     sources = (
         codex_sources_from_homes(args.codex_home)
         if args.codex_home

@@ -9,3 +9,5 @@ coverage/
 .tmp-codex-home-npx/
 .npm-cache/
 /tmp/
+/local-data/
+/local-config.json

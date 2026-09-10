@@ -1,4 +1,5 @@
 import datetime as dt
+from contextlib import closing
 import http.client
 import importlib.util
 import json
@@ -495,7 +496,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             second = {"timestamp": "2026-07-10T10:01:00Z", "type": "world_state", "payload": {}}
             first_line = json.dumps(first, separators=(",", ":")) + "\n"
             second_line = json.dumps(second, separators=(",", ":")) + "\n"
-            path.write_text(first_line + second_line, encoding="utf-8")
+            path.write_text(first_line + second_line, encoding="utf-8", newline="")
             stats = dashboard.RolloutReadStats()
 
             rows = dashboard.read_rollout_jsonl(path, stats=stats)
@@ -808,6 +809,11 @@ class CodexUsageDashboardTests(unittest.TestCase):
         )
 
     def test_bounded_period_loads_old_fork_parent_dependency(self) -> None:
+        # These fixture events belong to local calendar days, not UTC days.
+        def local_timestamp(value):
+            moment = dt.datetime.fromisoformat(value.removesuffix("Z"))
+            return dashboard.utc_iso(moment.astimezone())
+
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"
             parent_id = "parent-period-dependency"
@@ -817,7 +823,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 parent_id,
                 [
                     {
-                        "timestamp": "2026-07-08T13:00:00Z",
+                        "timestamp": local_timestamp("2026-07-08T13:00:00Z"),
                         "type": "session_meta",
                         "payload": {
                             "id": parent_id,
@@ -827,8 +833,8 @@ class CodexUsageDashboardTests(unittest.TestCase):
                             "model": "gpt-5",
                         },
                     },
-                    self.total_only_token_event("2026-07-08T14:00:00Z", 100, 100),
-                    self.total_only_token_event("2026-07-08T15:00:00Z", 250, 150),
+                    self.total_only_token_event(local_timestamp("2026-07-08T14:00:00Z"), 100, 100),
+                    self.total_only_token_event(local_timestamp("2026-07-08T15:00:00Z"), 250, 150),
                 ],
             )
             child_path = self.write_rollout_rows(
@@ -836,7 +842,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
                 child_id,
                 [
                     {
-                        "timestamp": "2026-07-09T01:00:00.000Z",
+                        "timestamp": local_timestamp("2026-07-09T01:00:00.000Z"),
                         "type": "session_meta",
                         "payload": {
                             "id": child_id,
@@ -848,9 +854,9 @@ class CodexUsageDashboardTests(unittest.TestCase):
                             "model": "gpt-5",
                         },
                     },
-                    self.total_only_token_event("2026-07-09T01:00:00.001Z", 100, 100),
-                    self.total_only_token_event("2026-07-09T01:00:00.002Z", 250, 150),
-                    self.total_only_token_event("2026-07-09T02:00:00Z", 320, 70),
+                    self.total_only_token_event(local_timestamp("2026-07-09T01:00:00.001Z"), 100, 100),
+                    self.total_only_token_event(local_timestamp("2026-07-09T01:00:00.002Z"), 250, 150),
+                    self.total_only_token_event(local_timestamp("2026-07-09T02:00:00Z"), 320, 70),
                 ],
             )
             _key, period_start, _period_end, _start_key, _end_key = dashboard.local_period_bounds(
@@ -1158,14 +1164,14 @@ for (const service_tier of ['default', 'standard', '']) {
             analyzer = dashboard.CodexUsageAnalyzer(home, resolve_project_info=False)
             first = analyzer.scan("all", include_remotes=False)
             self.assertAlmostEqual(first["sessions"][0]["estimated_cost_usd"], 0.002)
-            with sqlite3.connect(home / "logs_2.sqlite") as connection:
+            with closing(sqlite3.connect(home / "logs_2.sqlite")) as connection, connection:
                 connection.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, thread_id TEXT, target TEXT, feedback_log_body TEXT)")
                 base = int(dt.datetime(2026, 9, 5, tzinfo=dt.UTC).timestamp())
                 connection.execute("INSERT INTO logs VALUES (1, ?, 0, 'runtime-tier', 'codex_core::session::handlers', ?)", (base + 1, 'Submission sub=Submission { op: TurnInput { request: TurnInputRequest { thread_settings: ThreadSettingsOverrides { service_tier: Some(Some("priority")) }, start: TurnStartOptions { service_tier: None } } } }'))
             second = analyzer.scan("all", include_remotes=False)
             self.assertEqual(second["sessions"][0]["service_tiers"], ["priority"])
             self.assertAlmostEqual(second["sessions"][0]["estimated_cost_usd"], 0.004)
-            with sqlite3.connect(home / "logs_2.sqlite") as connection:
+            with closing(sqlite3.connect(home / "logs_2.sqlite")) as connection, connection:
                 connection.execute("INSERT INTO logs VALUES (2, ?, 0, 'runtime-tier', 'codex_core::session::handlers', ?)", (base + 3, 'Submission sub=Submission { op: TurnInput { request: TurnInputRequest { thread_settings: ThreadSettingsOverrides { service_tier: Some(None) } } } }'))
             third = analyzer.scan("all", include_remotes=False)
             self.assertEqual(third["sessions"][0]["service_tiers"], ["priority", "default"])
@@ -1193,7 +1199,7 @@ for (const service_tier of ['default', 'standard', '']) {
             home = Path(temp_dir)
             self.assertEqual(dashboard.runtime_service_tier_events(home, {"thread"}), {})
             self.assertFalse((home / "logs_2.sqlite").exists())
-            with sqlite3.connect(home / "logs_2.sqlite"):
+            with closing(sqlite3.connect(home / "logs_2.sqlite")):
                 pass
             self.assertEqual(dashboard.runtime_service_tier_events(home, {"thread"}), {})
 
@@ -2763,7 +2769,7 @@ for (const service_tier of ['default', 'standard', '']) {
             )
             first.scan("all")
             first.close()
-            with sqlite3.connect(cache_path) as connection:
+            with closing(sqlite3.connect(cache_path)) as connection, connection:
                 connection.execute(
                     "UPDATE parsed_files SET parser_version = ?",
                     (dashboard.PARSE_CACHE_VERSION - 1,),
@@ -2881,7 +2887,7 @@ for (const service_tier of ['default', 'standard', '']) {
             )
             second.scan("all")
             second.close()
-            with sqlite3.connect(cache_path) as connection:
+            with closing(sqlite3.connect(cache_path)) as connection, connection:
                 row_count = connection.execute("SELECT COUNT(*) FROM parsed_files").fetchone()[0]
 
         self.assertEqual(row_count, 0)
